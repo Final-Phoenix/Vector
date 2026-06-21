@@ -132,6 +132,66 @@ impl Chat {
     }
 
     // ========================================================================
+    // Message Search
+    // ========================================================================
+
+    /// Search messages by content (case-insensitive). Returns matching message IDs.
+    pub fn search_messages(&self, query: &str) -> Vec<String> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+
+        let query_lower = query.to_lowercase();
+        self.messages.iter()
+            .filter_map(|cm| {
+                if cm.content.to_lowercase().contains(&query_lower) {
+                    Some(decode_message_id(&cm.id))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Search messages by content and return full Message objects.
+    ///
+    /// Results are returned in chronological order (oldest first).
+    pub fn search_messages_full(&self, query: &str, interner: &NpubInterner) -> Vec<Message> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+
+        let query_lower = query.to_lowercase();
+        self.messages.iter()
+            .filter_map(|cm| {
+                if cm.content.to_lowercase().contains(&query_lower) {
+                    Some(cm.to_message(interner))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Search messages matching a predicate. Returns message IDs.
+    ///
+    /// Use this for complex filtering (e.g., by sender, timestamp, reactions).
+    pub fn search_messages_with<F>(&self, predicate: F) -> Vec<String>
+    where
+        F: Fn(&CompactMessage) -> bool,
+    {
+        self.messages.iter()
+            .filter_map(|cm| {
+                if predicate(cm) {
+                    Some(decode_message_id(&cm.id))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    // ========================================================================
     // Message Mutation
     // ========================================================================
 
@@ -594,6 +654,120 @@ mod tests {
         let marked = chat.set_as_read();
         assert!(!marked, "set_as_read should return false when all messages are mine");
         assert_eq!(chat.last_read, [0u8; 32], "last_read should remain zeroed");
+    }
+
+    // ========================================================================
+    // Message Search
+    // ========================================================================
+
+    #[test]
+    fn search_messages_by_content() {
+        let mut interner = NpubInterner::new();
+        let mut chat = Chat::new_dm("npub1peer".to_string(), &mut interner);
+
+        let msg1 = make_message(1, "hello world", 1700000001000, false);
+        let msg2 = make_message(2, "goodbye world", 1700000002000, false);
+        let msg3 = make_message(3, "hello again", 1700000003000, false);
+
+        chat.add_message(msg1.clone(), &mut interner);
+        chat.add_message(msg2, &mut interner);
+        chat.add_message(msg3.clone(), &mut interner);
+
+        let results = chat.search_messages("hello");
+        assert_eq!(results.len(), 2, "should find 2 messages with 'hello'");
+        assert!(results.contains(&msg1.id), "should find msg1");
+        assert!(results.contains(&msg3.id), "should find msg3");
+    }
+
+    #[test]
+    fn search_messages_case_insensitive() {
+        let mut interner = NpubInterner::new();
+        let mut chat = Chat::new_dm("npub1peer".to_string(), &mut interner);
+
+        let msg = make_message(1, "Hello World", 1700000001000, false);
+        chat.add_message(msg.clone(), &mut interner);
+
+        let results_lower = chat.search_messages("hello");
+        let results_upper = chat.search_messages("HELLO");
+        let results_mixed = chat.search_messages("HeLLo");
+
+        assert_eq!(results_lower.len(), 1, "lowercase query should match");
+        assert_eq!(results_upper.len(), 1, "uppercase query should match");
+        assert_eq!(results_mixed.len(), 1, "mixed case query should match");
+    }
+
+    #[test]
+    fn search_messages_empty_query() {
+        let mut interner = NpubInterner::new();
+        let mut chat = Chat::new_dm("npub1peer".to_string(), &mut interner);
+
+        chat.add_message(make_message(1, "hello", 1700000001000, false), &mut interner);
+        chat.add_message(make_message(2, "world", 1700000002000, false), &mut interner);
+
+        let results = chat.search_messages("");
+        assert!(results.is_empty(), "empty query should return no results");
+    }
+
+    #[test]
+    fn search_messages_no_matches() {
+        let mut interner = NpubInterner::new();
+        let mut chat = Chat::new_dm("npub1peer".to_string(), &mut interner);
+
+        chat.add_message(make_message(1, "hello world", 1700000001000, false), &mut interner);
+        chat.add_message(make_message(2, "goodbye world", 1700000002000, false), &mut interner);
+
+        let results = chat.search_messages("nonexistent");
+        assert!(results.is_empty(), "nonexistent query should return no results");
+    }
+
+    #[test]
+    fn search_messages_full_returns_message_objects() {
+        let mut interner = NpubInterner::new();
+        let mut chat = Chat::new_dm("npub1peer".to_string(), &mut interner);
+
+        let msg1 = make_message(1, "hello world", 1700000001000, false);
+        let msg2 = make_message(2, "goodbye world", 1700000002000, false);
+        let msg1_id = msg1.id.clone();
+
+        chat.add_message(msg1, &mut interner);
+        chat.add_message(msg2, &mut interner);
+
+        let results = chat.search_messages_full("hello", &interner);
+        assert_eq!(results.len(), 1, "should find 1 message");
+        assert_eq!(results[0].id, msg1_id, "should return the correct message");
+        assert_eq!(results[0].content, "hello world", "should preserve content");
+    }
+
+    #[test]
+    fn search_messages_with_predicate_sender() {
+        let mut interner = NpubInterner::new();
+        let mut chat = Chat::new_dm("npub1peer".to_string(), &mut interner);
+
+        let msg1 = make_message(1, "from me", 1700000001000, true);
+        let msg2 = make_message(2, "from them", 1700000002000, false);
+        let msg3 = make_message(3, "from me again", 1700000003000, true);
+
+        chat.add_message(msg1.clone(), &mut interner);
+        chat.add_message(msg2, &mut interner);
+        chat.add_message(msg3.clone(), &mut interner);
+
+        let my_messages = chat.search_messages_with(|cm| cm.flags.is_mine());
+        assert_eq!(my_messages.len(), 2, "should find 2 messages from me");
+        assert!(my_messages.contains(&msg1.id), "should contain msg1");
+        assert!(my_messages.contains(&msg3.id), "should contain msg3");
+    }
+
+    #[test]
+    fn search_messages_with_predicate_timestamp() {
+        let mut interner = NpubInterner::new();
+        let mut chat = Chat::new_dm("npub1peer".to_string(), &mut interner);
+
+        chat.add_message(make_message(1, "old", 1700000000000, false), &mut interner);
+        chat.add_message(make_message(2, "mid", 1700000010000, false), &mut interner);
+        chat.add_message(make_message(3, "new", 1700000020000, false), &mut interner);
+
+        let recent = chat.search_messages_with(|cm| cm.created_at > 1700000005000);
+        assert_eq!(recent.len(), 2, "should find 2 recent messages");
     }
 
     // ========================================================================
